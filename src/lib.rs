@@ -4,7 +4,6 @@ pub mod sunset_db {
     use std::fs::File;
     use std::io::{self, Error, Read, Seek, SeekFrom, Write};
     use std::mem::{size_of, size_of_val};
-    use std::path::Path;
 
     pub type Index = HashMap<String, u64>;
 
@@ -87,21 +86,20 @@ pub mod sunset_db {
         Ok(value)
     }
 
-    pub fn init(db_path: &Path) -> Result<Index, Box<dyn error::Error>> {
+    pub fn init_index(db: &mut File) -> Result<Index, Box<dyn error::Error>> {
         let mut index = Index::new();
+        db.rewind()?;
 
-        let mut db = File::options().read(true).open(db_path)?;
         let db_len = db.metadata()?.len();
-
         loop {
             let offset = db.stream_position()?;
             if offset == db_len {
                 break;
             }
 
-            let k = read_string(&mut db)?;
+            let k = read_string(db)?;
 
-            let len_v = read_int(&mut db)?;
+            let len_v = read_int(db)?;
             db.seek(SeekFrom::Current(i64::try_from(len_v)?))?;
 
             index.insert(k, offset);
@@ -112,60 +110,58 @@ pub mod sunset_db {
 
     #[cfg(test)]
     mod tests {
-        use crate::sunset_db::*;
-        use std::env::temp_dir;
-
-        #[test]
-        fn it_works() {
-            let result = 2 + 2;
-            assert_eq!(result, 4);
-        }
+        use super::*;
+        use tempfile::tempfile;
 
         fn on_disk_len(k: &str, v: &str) -> u64 {
             (LEN_PREFIX_SIZE + k.len() + LEN_PREFIX_SIZE + v.len()) as u64
         }
 
+        fn setup_db() -> Result<File, io::Error> {
+            tempfile()
+        }
+
         #[test]
-        fn test_e2e() {
-            let mut index = Index::new();
+        fn test_init_not_existing() -> Result<(), Box<dyn error::Error>> {
+            let mut db = setup_db()?;
+            let index_from_disk = init_index(&mut db)?;
+            assert_eq!(index_from_disk.len(), 0);
 
-            // TODO: This will clash on multiple test instances
-            let db_path = temp_dir().join("sunset.db");
-            {
-                let mut db = File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&db_path)
-                    .expect("Can't open DB file");
+            Ok(())
+        }
 
-                let inputs = [
-                    ("foo", "bar"),
-                    ("biz", "boo"),
-                    ("long_one", "continuing"),
-                    ("biz", "boo2"),
-                ];
+        #[test]
+        fn test_e2e() -> Result<(), Box<dyn error::Error>> {
+            let mut db = setup_db()?;
+            let mut index = init_index(&mut db)?;
 
-                for (k, v) in inputs {
-                    let f_size = db.metadata().unwrap().len();
-                    put(&mut index, &mut db, k, v).unwrap();
-                    let delta = db.metadata().unwrap().len() - f_size;
-                    assert_eq!(delta, on_disk_len(k, v));
+            let inputs = [
+                ("foo", "bar"),
+                ("biz", "boo"),
+                ("long_one", "continuing"),
+                ("biz", "boo2"),
+            ];
 
-                    let vv = get(&mut index, &mut db, k).unwrap();
-                    assert_eq!(vv, v);
-                }
+            for (k, v) in inputs {
+                let f_size = db.metadata()?.len();
+                put(&mut index, &mut db, k, v)?;
+                let delta = db.metadata()?.len() - f_size;
+                assert_eq!(delta, on_disk_len(k, v));
 
-                let vv = get(&mut index, &mut db, "biz").unwrap();
-                assert_eq!(vv, "boo2");
+                let vv = get(&mut index, &mut db, k)?;
+                assert_eq!(vv, v);
+            }
 
-                let inputs_sum: u64 = inputs.iter().map(|(k, v)| on_disk_len(k, v)).sum();
-                assert_eq!(db.metadata().unwrap().len(), inputs_sum);
-            } // Ensure DB is closed
+            let vv = get(&mut index, &mut db, "biz")?;
+            assert_eq!(vv, "boo2");
 
-            let index_from_disk = init(&db_path).expect("Failed to read index from disk");
+            let inputs_sum: u64 = inputs.iter().map(|(k, v)| on_disk_len(k, v)).sum();
+            assert_eq!(db.metadata()?.len(), inputs_sum);
+
+            let index_from_disk = init_index(&mut db)?;
             assert_eq!(index_from_disk, index);
+
+            Ok(())
         }
     }
 }
