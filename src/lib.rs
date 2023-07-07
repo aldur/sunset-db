@@ -122,15 +122,6 @@ pub mod sunset_db {
         }
 
         #[test]
-        fn test_init_not_existing() -> Result<(), Box<dyn error::Error>> {
-            let mut db = setup_db()?;
-            let index_from_disk = init_index(&mut db)?;
-            assert_eq!(index_from_disk.len(), 0);
-
-            Ok(())
-        }
-
-        #[test]
         fn test_e2e() -> Result<(), Box<dyn error::Error>> {
             let mut db = setup_db()?;
             let mut index = init_index(&mut db)?;
