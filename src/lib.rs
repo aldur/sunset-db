@@ -10,7 +10,11 @@ pub mod sunset_db {
     use std::path::{Path, PathBuf};
 
     pub type Index = HashMap<String, u64>;
+
     const SEGMENT_EXT: &str = "segment";
+
+    const TOMBSTONE: u64 = 1u64 << 63;
+    const ENCODED_TOMBSTONE: [u8; 8] = (TOMBSTONE).to_be_bytes();
 
     // NOTE: This will hold the file open 'til `Segment` is in memory.
     struct Segment {
@@ -21,13 +25,21 @@ pub mod sunset_db {
 
     #[derive(Debug, Clone)]
     pub struct KeyNotFoundError;
-
     impl fmt::Display for KeyNotFoundError {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             write!(f, "key not found")
         }
     }
     impl error::Error for KeyNotFoundError {}
+
+    #[derive(Debug, Clone)]
+    pub struct ValueTooBigError;
+    impl fmt::Display for ValueTooBigError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "value too big")
+        }
+    }
+    impl error::Error for ValueTooBigError {}
 
     impl Segment {
         pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
@@ -45,24 +57,40 @@ pub mod sunset_db {
         }
 
         pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
+            if value.len() as u64 & TOMBSTONE > 0 {
+                return Err(Box::new(ValueTooBigError));
+            }
+
             let offset = self.file.metadata()?.len();
 
             // Writing the `key` allows us to reconstruct `index` later on
             append_string(&mut self.file, key)?;
             append_string(&mut self.file, value)?;
 
+            // TODO: no need for `to_owned` if key already there?
             self.index.insert(key.to_owned(), offset);
 
             Ok(())
         }
 
+        pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
+            append_string(&mut self.file, key)?;
+            append_deletion(&mut self.file)?;
+            self.index.remove(key).ok_or(KeyNotFoundError)?;
+            Ok(())
+        }
+
         pub fn get(&mut self, key: &str) -> Result<String, Box<dyn error::Error>> {
             let key_offset: &u64 = self.index.get(key).ok_or(KeyNotFoundError)?;
-            assert_eq!(read_string_at_offset(&mut self.file, key_offset)?, key);
+            assert_eq!(
+                read_string_at_offset(&mut self.file, key_offset)?.ok_or("key should be there")?,
+                key
+            );
 
             let value_offset = *key_offset + LEN_PREFIX_SIZE as u64 + key.len() as u64;
             let value = read_string_at_offset(&mut self.file, &value_offset)?;
-            Ok(value)
+
+            value.ok_or(Box::new(KeyNotFoundError))
         }
 
         fn id_from_path(path: &Path) -> Result<u64, Box<dyn error::Error>> {
@@ -85,12 +113,16 @@ pub mod sunset_db {
                     break;
                 }
 
-                let k = read_string(file)?;
+                let k = read_string(file)?.ok_or("Expected key")?;
 
                 let len_v = read_int(file)?;
-                file.seek(SeekFrom::Current(i64::try_from(len_v)?))?;
-
-                index.insert(k, offset);
+                if len_v != TOMBSTONE {
+                    // XXX: Here we are decoding the tombstone but might compare at the byte level.
+                    index.insert(k, offset);
+                    file.seek(SeekFrom::Current(i64::try_from(len_v)?))?;
+                } else {
+                    index.remove(&k);
+                }
             }
 
             Ok(index)
@@ -164,7 +196,6 @@ pub mod sunset_db {
         }
 
         pub fn get(&mut self, key: &str) -> Result<String, KeyNotFoundError> {
-            // TODO: Implement me!
             for s in self.segments.iter_mut().rev() {
                 if let Ok(value) = s.get(key) {
                     return Ok(value);
@@ -174,13 +205,34 @@ pub mod sunset_db {
             Err(KeyNotFoundError)
         }
 
-        pub fn delete(&self, _key: &str) -> Result<(), Box<dyn error::Error>> {
-            // TODO: Implement me!
+        pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
+            let segment = self
+                .segments
+                .get_mut(0)
+                .ok_or("there should be at least one segment")?; // Created in `::new`
+            segment.delete(key)?;
             Ok(())
         }
     }
 
     const LEN_PREFIX_SIZE: usize = size_of::<u64>();
+
+    fn append_deletion(file: &mut File) -> Result<(), io::Error> {
+        file.seek(io::SeekFrom::End(0))?;
+        let tombstone = &ENCODED_TOMBSTONE;
+        let mut remaining = size_of_val(tombstone) as u64;
+
+        while remaining > 0 {
+            match file.write(tombstone) {
+                Err(e) => return Err(e),
+                Ok(written) => remaining -= written as u64,
+            }
+        }
+
+        // TODO: Add checksum!
+
+        Ok(())
+    }
 
     fn append_string(file: &mut File, b: &str) -> Result<(), io::Error> {
         file.seek(io::SeekFrom::End(0))?;
@@ -217,19 +269,23 @@ pub mod sunset_db {
         Ok(u64::from_be_bytes(int_b))
     }
 
-    fn read_string(file: &mut File) -> Result<String, Box<dyn error::Error>> {
+    fn read_string(file: &mut File) -> Result<Option<String>, Box<dyn error::Error>> {
         let string_len = read_int(file)?;
+        if string_len == TOMBSTONE {
+            // XXX: Here we are decoding the tombstone but might compare at the byte level.
+            return Ok(None); // Deleted
+        }
 
         let mut string_b = vec![0; usize::try_from(string_len)?];
         file.read_exact(&mut string_b)?;
 
-        Ok(String::from_utf8(string_b)?)
+        Ok(Some(String::from_utf8(string_b)?))
     }
 
     fn read_string_at_offset(
         file: &mut File,
         offset: &u64,
-    ) -> Result<String, Box<dyn error::Error>> {
+    ) -> Result<Option<String>, Box<dyn error::Error>> {
         // TODO: Maybe use `seek_read`?
         file.seek(io::SeekFrom::Start(*offset))?;
         read_string(file)
@@ -273,12 +329,16 @@ pub mod sunset_db {
         }
 
         #[test]
-        fn test_sunsetdb_insert_get() -> Result<(), Box<dyn error::Error>> {
+        fn test_sunsetdb_insert_get_delete() -> Result<(), Box<dyn error::Error>> {
             let base_dir = new_base()?;
             let mut s = SunsetDB::new(base_dir.path())?;
 
             s.insert("k", "v")?;
             assert_eq!(s.get("k")?, "v");
+            s.insert("k", "vv")?;
+            assert_eq!(s.get("k")?, "vv");
+            s.delete("k")?;
+            assert!(s.delete("k").is_err());
 
             Ok(())
         }
@@ -316,6 +376,8 @@ pub mod sunset_db {
 
             let inputs_sum: u64 = inputs.iter().map(|(k, v)| encoded_len(k, v)).sum();
             assert_eq!(segment_path.metadata()?.len(), inputs_sum);
+
+            segment.delete("biz")?;
 
             let segment_from_disk = Segment::new(segment_path.as_path())?;
             assert_eq!(segment_from_disk.index, segment.index);
