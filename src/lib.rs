@@ -2,6 +2,7 @@ pub mod sunset_db {
     use std::collections::HashMap;
     use std::error;
     use std::ffi::OsStr;
+    use std::fmt;
     use std::fs::{read_dir, File, OpenOptions};
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::mem::{size_of, size_of_val};
@@ -9,16 +10,41 @@ pub mod sunset_db {
     use std::path::{Path, PathBuf};
 
     pub type Index = HashMap<String, u64>;
-    const SEGMENT_EXT: &[u8] = b"segment";
+    const SEGMENT_EXT: &str = "segment";
 
     // NOTE: This will hold the file open 'til `Segment` is in memory.
     struct Segment {
+        id: u64,
         file: File,
         index: Index,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct KeyNotFoundError;
+
+    impl fmt::Display for KeyNotFoundError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "key not found")
+        }
+    }
+    impl error::Error for KeyNotFoundError {}
+
     impl Segment {
-        pub fn put(&mut self, key: &str, value: &str) -> Result<(), std::io::Error> {
+        pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            let index = Segment::index_from_disk(&mut f);
+            Ok::<_, Box<dyn error::Error>>(Segment {
+                id: Segment::id_from_path(path)?,
+                file: f,
+                index: index?,
+            })
+        }
+
+        pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
             let offset = self.file.metadata()?.len();
 
             // Writing the `key` allows us to reconstruct `index` later on
@@ -31,7 +57,7 @@ pub mod sunset_db {
         }
 
         pub fn get(&mut self, key: &str) -> Result<String, Box<dyn error::Error>> {
-            let key_offset: &u64 = self.index.get(key).ok_or("Couldn't find key in index")?;
+            let key_offset: &u64 = self.index.get(key).ok_or(KeyNotFoundError)?;
             assert_eq!(read_string_at_offset(&mut self.file, key_offset)?, key);
 
             let value_offset = *key_offset + LEN_PREFIX_SIZE as u64 + key.len() as u64;
@@ -39,13 +65,13 @@ pub mod sunset_db {
             Ok(value)
         }
 
-        pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
-            let mut f = OpenOptions::new().read(true).write(true).open(path)?;
-            let index = Segment::index_from_disk(&mut f);
-            Ok::<_, Box<dyn error::Error>>(Segment {
-                file: f,
-                index: index?,
-            })
+        fn id_from_path(path: &Path) -> Result<u64, Box<dyn error::Error>> {
+            Ok(path
+                .file_stem()
+                .ok_or("Can't get file stem")?
+                .to_str()
+                .ok_or("Can't convert file stem to &str")?
+                .parse()?)
         }
 
         fn index_from_disk(file: &mut File) -> Result<Index, Box<dyn error::Error>> {
@@ -74,6 +100,7 @@ pub mod sunset_db {
     pub struct SunsetDB {
         base_path: PathBuf,
         segments: Vec<Segment>,
+        next_index: u64,
     }
 
     impl SunsetDB {
@@ -82,30 +109,69 @@ pub mod sunset_db {
                 // WARNING: This will filter out errors on `read_dir`.
                 .filter_map(Result::ok)
                 .map(|e| e.path())
-                .filter(|p| p.extension() == Some(OsStr::from_bytes(SEGMENT_EXT)))
+                .filter(|p| p.extension() == Some(OsStr::from_bytes(SEGMENT_EXT.as_bytes())))
                 .collect();
 
+            // least to most recent timestamp
             paths.sort(); // read_dir does not guarantee sorting
-            paths.reverse(); // most to least recent timestamp
 
-            let segments: Result<Vec<_>, _> = paths.iter().map(|p| Segment::new(p)).collect();
+            let segments = paths
+                .iter()
+                .map(|p| Segment::new(p))
+                .collect::<Result<Vec<_>, _>>()?;
 
-            Ok(SunsetDB {
+            let next_index: u64;
+            if let Some(s) = segments.last() {
+                next_index = s.id + 1;
+            } else {
+                next_index = 0;
+            }
+
+            let mut db = SunsetDB {
                 base_path: base_path.to_path_buf(),
-                segments: segments?,
-            })
+                segments,
+                next_index,
+            };
+
+            if db.segments.is_empty() {
+                db.add_new_segment()?;
+            }
+
+            Ok(db)
         }
 
-        pub fn put(&self, _key: &str, _value: &str) -> Result<(), Box<dyn error::Error>> {
-            // let segment = self.segments.get(0); // Always `put` in most recent segment
-            // self.put(key, value);
+        fn path_from_id(&self, id: u64) -> PathBuf {
+            self.base_path.join(format!("{}.{}", id, SEGMENT_EXT))
+        }
+
+        fn add_new_segment(&mut self) -> Result<(), Box<dyn error::Error>> {
+            let path = self.path_from_id(self.next_index);
+            self.segments.push(Segment::new(path.as_path())?);
+            self.next_index += 1;
+            Ok(())
+        }
+
+        pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
+            let segment = self
+                .segments
+                .get_mut(0)
+                .ok_or("there should be at least one segment")?; // Created in `::new`
+            segment.insert(key, value)?;
+
+            // TODO: Close segment if it grows too large.
 
             Ok(())
         }
 
-        pub fn get(&self, _key: &str) -> Result<String, Box<dyn error::Error>> {
+        pub fn get(&mut self, key: &str) -> Result<String, KeyNotFoundError> {
             // TODO: Implement me!
-            Ok("TODO".to_string())
+            for s in self.segments.iter_mut().rev() {
+                if let Ok(value) = s.get(key) {
+                    return Ok(value);
+                }
+            }
+
+            Err(KeyNotFoundError)
         }
 
         pub fn delete(&self, _key: &str) -> Result<(), Box<dyn error::Error>> {
@@ -172,7 +238,7 @@ pub mod sunset_db {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use tempfile::{tempdir, NamedTempFile, TempDir};
+        use tempfile::{tempdir, TempDir};
 
         fn encoded_len(k: &str, v: &str) -> u64 {
             (LEN_PREFIX_SIZE + k.len() + LEN_PREFIX_SIZE + v.len()) as u64
@@ -180,10 +246,6 @@ pub mod sunset_db {
 
         fn new_base() -> io::Result<TempDir> {
             tempdir()
-        }
-
-        fn new_temp_file() -> Result<NamedTempFile, io::Error> {
-            NamedTempFile::new()
         }
 
         #[test]
@@ -206,14 +268,29 @@ pub mod sunset_db {
             let base_dir = new_base()?;
             let s = SunsetDB::new(base_dir.path())?;
             assert_eq!(s.base_path, base_dir.path());
-            assert_eq!(s.segments.len(), 0);
+            assert_eq!(s.segments.len(), 1); // ::new creates a new segment by default
+            Ok(())
+        }
+
+        #[test]
+        fn test_sunsetdb_insert_get() -> Result<(), Box<dyn error::Error>> {
+            let base_dir = new_base()?;
+            let mut s = SunsetDB::new(base_dir.path())?;
+
+            s.insert("k", "v")?;
+            assert_eq!(s.get("k")?, "v");
+
             Ok(())
         }
 
         #[test]
         fn test_segment_e2e() -> Result<(), Box<dyn error::Error>> {
-            let db_temp_file = new_temp_file()?;
-            let mut segment = Segment::new(db_temp_file.path())?;
+            let new_base = new_base()?;
+
+            let id: u64 = 42;
+            let segment_path = new_base.path().join(format!("{}.{}", id, SEGMENT_EXT));
+            let mut segment = Segment::new(segment_path.as_path())?;
+            assert_eq!(id, segment.id);
 
             let inputs = [
                 ("foo", "bar"),
@@ -225,9 +302,9 @@ pub mod sunset_db {
             ];
 
             for (k, v) in inputs {
-                let f_size = db_temp_file.as_file().metadata()?.len();
-                segment.put(k, v)?;
-                let delta = db_temp_file.as_file().metadata()?.len() - f_size;
+                let f_size = segment_path.metadata()?.len();
+                segment.insert(k, v)?;
+                let delta = segment_path.metadata()?.len() - f_size;
                 assert_eq!(delta, encoded_len(k, v));
 
                 let vv = segment.get(k)?;
@@ -238,9 +315,9 @@ pub mod sunset_db {
             assert_eq!(vv, "boo2");
 
             let inputs_sum: u64 = inputs.iter().map(|(k, v)| encoded_len(k, v)).sum();
-            assert_eq!(db_temp_file.as_file().metadata()?.len(), inputs_sum);
+            assert_eq!(segment_path.metadata()?.len(), inputs_sum);
 
-            let segment_from_disk = Segment::new(db_temp_file.path())?;
+            let segment_from_disk = Segment::new(segment_path.as_path())?;
             assert_eq!(segment_from_disk.index, segment.index);
 
             Ok(())
