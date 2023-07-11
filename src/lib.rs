@@ -5,7 +5,7 @@ pub mod sunset_db {
     use std::fmt;
     use std::fs::{read_dir, File, OpenOptions};
     use std::io::{self, Read, Seek, SeekFrom, Write};
-    use std::mem::{size_of, size_of_val};
+    use std::mem::size_of;
     use std::os::unix::prelude::OsStrExt;
     use std::path::{Path, PathBuf};
 
@@ -41,6 +41,15 @@ pub mod sunset_db {
     }
     impl error::Error for ValueTooBigError {}
 
+    #[derive(Debug, Clone)]
+    pub struct InvalidChecksumError;
+    impl fmt::Display for InvalidChecksumError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "invalid checksum")
+        }
+    }
+    impl error::Error for InvalidChecksumError {}
+
     impl Segment {
         pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
             let mut f = OpenOptions::new()
@@ -68,6 +77,7 @@ pub mod sunset_db {
             append_string(&mut self.file, value)?;
 
             // TODO: no need for `to_owned` if key already there?
+            // https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html
             self.index.insert(key.to_owned(), offset);
 
             Ok(())
@@ -81,14 +91,14 @@ pub mod sunset_db {
         }
 
         pub fn get(&mut self, key: &str) -> Result<String, Box<dyn error::Error>> {
-            let key_offset: &u64 = self.index.get(key).ok_or(KeyNotFoundError)?;
+            let mut offset: u64 = *self.index.get(key).ok_or(KeyNotFoundError)?;
             assert_eq!(
-                read_string_at_offset(&mut self.file, key_offset)?.ok_or("key should be there")?,
+                read_string_at_offset(&mut self.file, offset)?.ok_or("key should be there")?,
                 key
             );
 
-            let value_offset = *key_offset + LEN_PREFIX_SIZE as u64 + key.len() as u64;
-            let value = read_string_at_offset(&mut self.file, &value_offset)?;
+            offset += LEN_PREFIX_SIZE as u64 + key.len() as u64 + CRC32_SUFFIX_SIZE as u64;
+            let value = read_string_at_offset(&mut self.file, offset)?;
 
             value.ok_or(Box::new(KeyNotFoundError))
         }
@@ -113,13 +123,15 @@ pub mod sunset_db {
                     break;
                 }
 
-                let k = read_string(file)?.ok_or("Expected key")?;
+                let k = read_string_crc32(file)?.ok_or("Expected key")?;
 
-                let len_v = read_int(file)?;
-                if len_v != TOMBSTONE {
-                    // XXX: Here we are decoding the tombstone but might compare at the byte level.
+                let len_v_b = read_u64_bytes(file)?;
+                if len_v_b != ENCODED_TOMBSTONE {
                     index.insert(k, offset);
-                    file.seek(SeekFrom::Current(i64::try_from(len_v)?))?;
+                    let len_v = parse_u64_bytes(len_v_b)?;
+                    file.seek(SeekFrom::Current(i64::try_from(
+                        len_v + CRC32_SUFFIX_SIZE as u64,
+                    )?))?;
                 } else {
                     index.remove(&k);
                 }
@@ -216,79 +228,73 @@ pub mod sunset_db {
     }
 
     const LEN_PREFIX_SIZE: usize = size_of::<u64>();
+    const CRC32_SUFFIX_SIZE: usize = size_of::<u32>();
 
-    fn append_deletion(file: &mut File) -> Result<(), io::Error> {
+    fn append_deletion(file: &mut File) -> Result<(), Box<dyn error::Error>> {
         file.seek(io::SeekFrom::End(0))?;
-        let tombstone = &ENCODED_TOMBSTONE;
-        let mut remaining = size_of_val(tombstone) as u64;
+        file.write_all(&ENCODED_TOMBSTONE)?;
 
-        while remaining > 0 {
-            match file.write(tombstone) {
-                Err(e) => return Err(e),
-                Ok(written) => remaining -= written as u64,
-            }
-        }
-
-        // TODO: Add checksum!
+        // XXX: Write checkum for TOMBSTONE too?
+        // let checksum = crc32fast::hash(&ENCODED_TOMBSTONE);
+        // write_whole(file, &checksum.to_be_bytes())?;
 
         Ok(())
     }
 
-    fn append_string(file: &mut File, b: &str) -> Result<(), io::Error> {
+    fn append_string(file: &mut File, b: &str) -> Result<(), Box<dyn error::Error>> {
         file.seek(io::SeekFrom::End(0))?;
 
         // Cast all to u64 and use big endian to make this portable across machines.
-        let b_len = b.len() as u64;
-        let mut remaining = size_of_val(&b_len) as u64;
-        let b_len_bytes = &b_len.to_be_bytes();
+        let b_len_bytes = b.len().to_be_bytes();
+        file.write_all(&b_len_bytes)?;
 
-        while remaining > 0 {
-            match file.write(b_len_bytes) {
-                Err(e) => return Err(e),
-                Ok(written) => remaining -= written as u64,
-            }
-        }
+        let b_bytes = b.as_bytes();
+        file.write_all(b_bytes)?;
 
-        remaining = b_len;
-
-        while remaining > 0 {
-            match file.write(b.as_bytes()) {
-                Err(e) => return Err(e),
-                Ok(written) => remaining -= written as u64,
-            }
-        }
-
-        // TODO: Add checksum!
+        let checksum = crc32fast::hash(b_bytes);
+        file.write_all(&checksum.to_be_bytes())?;
 
         Ok(())
     }
 
-    fn read_int(file: &mut File) -> Result<u64, Box<dyn error::Error>> {
+    fn read_u64_bytes(file: &mut File) -> Result<[u8; LEN_PREFIX_SIZE], Box<dyn error::Error>> {
         let mut int_b = [0; LEN_PREFIX_SIZE];
         file.read_exact(&mut int_b)?;
-        Ok(u64::from_be_bytes(int_b))
+        Ok(int_b)
     }
 
-    fn read_string(file: &mut File) -> Result<Option<String>, Box<dyn error::Error>> {
-        let string_len = read_int(file)?;
-        if string_len == TOMBSTONE {
-            // XXX: Here we are decoding the tombstone but might compare at the byte level.
+    fn parse_u64_bytes(i: [u8; LEN_PREFIX_SIZE]) -> Result<u64, Box<dyn error::Error>> {
+        Ok(u64::from_be_bytes(i))
+    }
+
+    fn read_string_crc32(file: &mut File) -> Result<Option<String>, Box<dyn error::Error>> {
+        let string_len_b = read_u64_bytes(file)?;
+        if string_len_b == ENCODED_TOMBSTONE {
             return Ok(None); // Deleted
         }
 
+        let string_len = parse_u64_bytes(string_len_b)?;
         let mut string_b = vec![0; usize::try_from(string_len)?];
         file.read_exact(&mut string_b)?;
+
+        let mut checksum_b = [0; CRC32_SUFFIX_SIZE];
+        file.read_exact(&mut checksum_b)?;
+        let checksum = u32::from_be_bytes(checksum_b);
+
+        if checksum != crc32fast::hash(&string_b) {
+            return Err(Box::new(InvalidChecksumError));
+        }
 
         Ok(Some(String::from_utf8(string_b)?))
     }
 
     fn read_string_at_offset(
         file: &mut File,
-        offset: &u64,
+        offset: u64,
     ) -> Result<Option<String>, Box<dyn error::Error>> {
         // TODO: Maybe use `seek_read`?
-        file.seek(io::SeekFrom::Start(*offset))?;
-        read_string(file)
+        file.seek(io::SeekFrom::Start(offset))?;
+        read_string_crc32(file)
     }
 
     #[cfg(test)]
@@ -297,7 +303,12 @@ pub mod sunset_db {
         use tempfile::{tempdir, TempDir};
 
         fn encoded_len(k: &str, v: &str) -> u64 {
-            (LEN_PREFIX_SIZE + k.len() + LEN_PREFIX_SIZE + v.len()) as u64
+            (LEN_PREFIX_SIZE
+                + k.len()
+                + CRC32_SUFFIX_SIZE
+                + LEN_PREFIX_SIZE
+                + v.len()
+                + CRC32_SUFFIX_SIZE) as u64
         }
 
         fn new_base() -> io::Result<TempDir> {
