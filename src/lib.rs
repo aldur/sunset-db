@@ -13,10 +13,11 @@ pub mod sunset_db {
 
     const SEGMENT_EXT: &str = "segment";
 
+    // TODO: Switch to using an empty byte string as the tombstone?
     const TOMBSTONE: u64 = 1u64 << 63;
-    const ENCODED_TOMBSTONE: [u8; 8] = (TOMBSTONE).to_be_bytes();
+    const ENCODED_TOMBSTONE: [u8; size_of::<u64>()] = (TOMBSTONE).to_be_bytes();
 
-    // NOTE: This will hold the file open 'til `Segment` is in memory.
+    // NOTE: This will hold the file open as long as `Segment` is in memory.
     struct Segment {
         id: u64,
         file: File,
@@ -33,13 +34,13 @@ pub mod sunset_db {
     impl error::Error for KeyNotFoundError {}
 
     #[derive(Debug, Clone)]
-    pub struct ValueTooBigError;
-    impl fmt::Display for ValueTooBigError {
+    pub struct ExceedsMaxSizeError;
+    impl fmt::Display for ExceedsMaxSizeError {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "value too big")
+            write!(f, "exceeds max size")
         }
     }
-    impl error::Error for ValueTooBigError {}
+    impl error::Error for ExceedsMaxSizeError {}
 
     #[derive(Debug, Clone)]
     pub struct InvalidChecksumError;
@@ -50,12 +51,14 @@ pub mod sunset_db {
     }
     impl error::Error for InvalidChecksumError {}
 
+    // TODO: Is there a better way to handle errors other than boxing them?
+
     impl Segment {
         pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
             let mut f = OpenOptions::new()
-                .create(true)
+                .create(true) // TODO: Should not try to create all segments.
                 .read(true)
-                .write(true)
+                .write(true) // TODO: Only most recent segment should be open for write.
                 .open(path)?;
             let index = Segment::index_from_disk(&mut f);
             Ok::<_, Box<dyn error::Error>>(Segment {
@@ -66,12 +69,13 @@ pub mod sunset_db {
         }
 
         pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
-            if value.len() as u64 & TOMBSTONE > 0 {
-                return Err(Box::new(ValueTooBigError));
+            if value.len() as u64 & TOMBSTONE > 0 || key.len() as u64 > u64::MAX {
+                return Err(Box::new(ExceedsMaxSizeError));
             }
 
             let offset = self.file.metadata()?.len();
 
+            // TODO: Write the CRC only once per record.
             // Writing the `key` allows us to reconstruct `index` later on
             append_string(&mut self.file, key)?;
             append_string(&mut self.file, value)?;
@@ -116,6 +120,8 @@ pub mod sunset_db {
             let mut index = Index::new();
             file.rewind()?; // Should not be required.
 
+            // TODO: If possible, instead of a full disk read read from a dump of the HashMap
+
             let db_len = file.metadata()?.len();
             loop {
                 let offset = file.stream_position()?;
@@ -124,6 +130,8 @@ pub mod sunset_db {
                 }
 
                 let k = read_string_crc32(file)?.ok_or("Expected key")?;
+
+                // TODO: Ignore data invalid checksums.
 
                 let len_v_b = read_u64_bytes(file)?;
                 if len_v_b != ENCODED_TOMBSTONE {
@@ -156,7 +164,7 @@ pub mod sunset_db {
                 .filter(|p| p.extension() == Some(OsStr::from_bytes(SEGMENT_EXT.as_bytes())))
                 .collect();
 
-            // least to most recent timestamp
+            // least to most recent ID
             paths.sort(); // read_dir does not guarantee sorting
 
             let segments = paths
@@ -203,6 +211,7 @@ pub mod sunset_db {
             segment.insert(key, value)?;
 
             // TODO: Close segment if it grows too large.
+            // TODO: Merge segments and claim space.
 
             Ok(())
         }
