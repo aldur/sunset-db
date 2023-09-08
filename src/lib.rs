@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::error;
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs::{read_dir, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -23,53 +21,64 @@ struct Segment {
     index: Index,
 }
 
-#[derive(Debug, Clone)]
-pub struct KeyNotFoundError;
-impl fmt::Display for KeyNotFoundError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "key not found")
-    }
-}
-impl error::Error for KeyNotFoundError {}
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
-pub struct ExceedsMaxSizeError;
-impl fmt::Display for ExceedsMaxSizeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "exceeds max size")
-    }
-}
-impl error::Error for ExceedsMaxSizeError {}
+#[derive(Error, Debug)]
+pub enum SunsetDBError {
+    #[error("key not found")]
+    KeyNotFound,
 
-#[derive(Debug, Clone)]
-pub struct InvalidChecksumError;
-impl fmt::Display for InvalidChecksumError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "invalid checksum")
-    }
-}
-impl error::Error for InvalidChecksumError {}
+    #[error("there should be at least a segment")]
+    NoSegments,
 
-// TODO: Is there a better way to handle errors other than boxing them?
+    // TODO: Add how much
+    #[error("exceeds max size (expected < {})", u64::MAX)]
+    ExceedsMaxSize,
+
+    #[error("invalid checksum (expected {expected:?}, found {found:?})")]
+    InvalidChecksum { expected: u32, found: u32 },
+
+    #[error("io error")]
+    IO(#[from] io::Error),
+
+    // TODO: Return ID?
+    #[error("invalid ID")]
+    InvalidID(#[from] std::num::ParseIntError),
+
+    #[error("invalid string")]
+    InvalidString {
+        #[from]
+        source: std::string::FromUtf8Error,
+    },
+
+    #[error("invalid int")]
+    InvalidInt(#[from] std::num::TryFromIntError),
+
+    #[error("unexpected: {0:?}")]
+    Unexpected(String),
+}
+
+pub type Result<T> = std::result::Result<T, SunsetDBError>;
 
 impl Segment {
-    pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
+    pub fn new(path: &Path) -> Result<Segment> {
         let mut f = OpenOptions::new()
             .create(true) // TODO: Should not try to create all segments.
             .read(true)
             .write(true) // TODO: Only most recent segment should be open for write.
             .open(path)?;
         let index = Segment::index_from_disk(&mut f);
-        Ok::<_, Box<dyn error::Error>>(Segment {
+        Ok::<_, _>(Segment {
             id: Segment::id_from_path(path)?,
             file: f,
             index: index?,
         })
     }
 
-    pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
+    pub fn insert(&mut self, key: &str, value: &str) -> Result<()> {
+        // FIXME: This check doesn't make any sense.
         if value.len() as u64 & TOMBSTONE > 0 || key.len() as u64 > u64::MAX {
-            return Err(Box::new(ExceedsMaxSizeError));
+            return Err(SunsetDBError::ExceedsMaxSize);
         }
 
         let offset = self.file.metadata()?.len();
@@ -86,36 +95,39 @@ impl Segment {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
+    pub fn delete(&mut self, key: &str) -> Result<()> {
         append_string(&mut self.file, key)?;
         append_deletion(&mut self.file)?;
-        self.index.remove(key).ok_or(KeyNotFoundError)?;
+        self.index.remove(key).ok_or(SunsetDBError::KeyNotFound)?;
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<String, Box<dyn error::Error>> {
-        let mut offset: u64 = *self.index.get(key).ok_or(KeyNotFoundError)?;
+    pub fn get(&mut self, key: &str) -> Result<String> {
+        let mut offset: u64 = *self.index.get(key).ok_or(SunsetDBError::KeyNotFound)?;
         assert_eq!(
-            read_string_at_offset(&mut self.file, offset)?.ok_or("key should be there")?,
+            read_string_at_offset(&mut self.file, offset)?
+                .ok_or(SunsetDBError::Unexpected("key should be there".to_string()))?,
             key
         );
 
         offset += LEN_PREFIX_SIZE as u64 + key.len() as u64 + CRC32_SUFFIX_SIZE as u64;
         let value = read_string_at_offset(&mut self.file, offset)?;
 
-        value.ok_or(Box::new(KeyNotFoundError))
+        value.ok_or(SunsetDBError::KeyNotFound)
     }
 
-    fn id_from_path(path: &Path) -> Result<u64, Box<dyn error::Error>> {
+    fn id_from_path(path: &Path) -> Result<u64> {
         Ok(path
             .file_stem()
-            .ok_or("Can't get file stem")?
+            .ok_or(SunsetDBError::Unexpected("Can't get file stem".to_string()))?
             .to_str()
-            .ok_or("Can't convert file stem to &str")?
+            .ok_or(SunsetDBError::Unexpected(
+                "Can't convert file stem to &str".to_string(),
+            ))?
             .parse()?)
     }
 
-    fn index_from_disk(file: &mut File) -> Result<Index, Box<dyn error::Error>> {
+    fn index_from_disk(file: &mut File) -> Result<Index> {
         let mut index = Index::new();
         file.rewind()?; // Should not be required.
 
@@ -128,7 +140,8 @@ impl Segment {
                 break;
             }
 
-            let k = read_string_crc32(file)?.ok_or("Expected key")?;
+            let k = read_string_crc32(file)?
+                .ok_or(SunsetDBError::Unexpected("Expected key".to_string()))?;
 
             // TODO: Ignore data invalid checksums.
 
@@ -155,10 +168,10 @@ pub struct SunsetDB {
 }
 
 impl SunsetDB {
-    pub fn new(base_path: &Path) -> Result<SunsetDB, Box<dyn error::Error>> {
+    pub fn new(base_path: &Path) -> Result<SunsetDB> {
         let mut paths: Vec<_> = read_dir(base_path)?
             // WARNING: This will filter out errors on `read_dir`.
-            .filter_map(Result::ok)
+            .filter_map(std::io::Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension() == Some(OsStr::from_bytes(SEGMENT_EXT.as_bytes())))
             .collect();
@@ -169,7 +182,7 @@ impl SunsetDB {
         let segments = paths
             .iter()
             .map(|p| Segment::new(p))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         let next_index: u64;
         if let Some(s) = segments.last() {
@@ -195,18 +208,15 @@ impl SunsetDB {
         self.base_path.join(format!("{}.{}", id, SEGMENT_EXT))
     }
 
-    fn add_new_segment(&mut self) -> Result<(), Box<dyn error::Error>> {
+    fn add_new_segment(&mut self) -> Result<()> {
         let path = self.path_from_id(self.next_index);
         self.segments.push(Segment::new(path.as_path())?);
         self.next_index += 1;
         Ok(())
     }
 
-    pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
-        let segment = self
-            .segments
-            .get_mut(0)
-            .ok_or("there should be at least one segment")?; // Created in `::new`
+    pub fn insert(&mut self, key: &str, value: &str) -> Result<()> {
+        let segment = self.segments.get_mut(0).ok_or(SunsetDBError::NoSegments)?; // Created in `::new`
         segment.insert(key, value)?;
 
         // TODO: Close segment if it grows too large.
@@ -215,21 +225,18 @@ impl SunsetDB {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<String, KeyNotFoundError> {
+    pub fn get(&mut self, key: &str) -> Result<String> {
         for s in self.segments.iter_mut().rev() {
             if let Ok(value) = s.get(key) {
                 return Ok(value);
             }
         }
 
-        Err(KeyNotFoundError)
+        Err(SunsetDBError::KeyNotFound)
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
-        let segment = self
-            .segments
-            .get_mut(0)
-            .ok_or("there should be at least one segment")?; // Created in `::new`
+    pub fn delete(&mut self, key: &str) -> Result<()> {
+        let segment = self.segments.get_mut(0).ok_or(SunsetDBError::NoSegments)?; // Created in `::new`
         segment.delete(key)?;
         Ok(())
     }
@@ -238,7 +245,7 @@ impl SunsetDB {
 const LEN_PREFIX_SIZE: usize = size_of::<u64>();
 const CRC32_SUFFIX_SIZE: usize = size_of::<u32>();
 
-fn append_deletion(file: &mut File) -> Result<(), Box<dyn error::Error>> {
+fn append_deletion(file: &mut File) -> Result<()> {
     file.seek(io::SeekFrom::End(0))?;
     file.write_all(&ENCODED_TOMBSTONE)?;
 
@@ -249,7 +256,7 @@ fn append_deletion(file: &mut File) -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-fn append_string(file: &mut File, b: &str) -> Result<(), Box<dyn error::Error>> {
+fn append_string(file: &mut File, b: &str) -> Result<()> {
     file.seek(io::SeekFrom::End(0))?;
 
     // Cast all to u64 and use big endian to make this portable across machines.
@@ -265,17 +272,17 @@ fn append_string(file: &mut File, b: &str) -> Result<(), Box<dyn error::Error>> 
     Ok(())
 }
 
-fn read_u64_bytes(file: &mut File) -> Result<[u8; LEN_PREFIX_SIZE], Box<dyn error::Error>> {
+fn read_u64_bytes(file: &mut File) -> Result<[u8; LEN_PREFIX_SIZE]> {
     let mut int_b = [0; LEN_PREFIX_SIZE];
     file.read_exact(&mut int_b)?;
     Ok(int_b)
 }
 
-fn parse_u64_bytes(i: [u8; LEN_PREFIX_SIZE]) -> Result<u64, Box<dyn error::Error>> {
+fn parse_u64_bytes(i: [u8; LEN_PREFIX_SIZE]) -> Result<u64> {
     Ok(u64::from_be_bytes(i))
 }
 
-fn read_string_crc32(file: &mut File) -> Result<Option<String>, Box<dyn error::Error>> {
+fn read_string_crc32(file: &mut File) -> Result<Option<String>> {
     let string_len_b = read_u64_bytes(file)?;
     if string_len_b == ENCODED_TOMBSTONE {
         return Ok(None); // Deleted
@@ -288,18 +295,19 @@ fn read_string_crc32(file: &mut File) -> Result<Option<String>, Box<dyn error::E
     let mut checksum_b = [0; CRC32_SUFFIX_SIZE];
     file.read_exact(&mut checksum_b)?;
     let checksum = u32::from_be_bytes(checksum_b);
+    let expected = crc32fast::hash(&string_b);
 
-    if checksum != crc32fast::hash(&string_b) {
-        return Err(Box::new(InvalidChecksumError));
+    if checksum != expected {
+        return Err(SunsetDBError::InvalidChecksum {
+            expected,
+            found: checksum,
+        });
     }
 
     Ok(Some(String::from_utf8(string_b)?))
 }
 
-fn read_string_at_offset(
-    file: &mut File,
-    offset: u64,
-) -> Result<Option<String>, Box<dyn error::Error>> {
+fn read_string_at_offset(file: &mut File, offset: u64) -> Result<Option<String>> {
     // TODO: Maybe use `seek_read`?
     file.seek(io::SeekFrom::Start(offset))?;
     read_string_crc32(file)
@@ -324,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_base_is_automatically_deleted() -> Result<(), Box<dyn error::Error>> {
+    fn test_base_is_automatically_deleted() -> Result<()> {
         let created_p: PathBuf;
 
         {
@@ -339,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_empty_base_path() -> Result<(), Box<dyn error::Error>> {
+    fn test_sunsetdb_empty_base_path() -> Result<()> {
         let base_dir = new_base()?;
         let s = SunsetDB::new(base_dir.path())?;
         assert_eq!(s.base_path, base_dir.path());
@@ -348,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_insert_get_delete() -> Result<(), Box<dyn error::Error>> {
+    fn test_sunsetdb_insert_get_delete() -> Result<()> {
         let base_dir = new_base()?;
         let mut s = SunsetDB::new(base_dir.path())?;
 
@@ -363,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_e2e() -> Result<(), Box<dyn error::Error>> {
+    fn test_segment_e2e() -> Result<()> {
         let new_base = new_base()?;
 
         let id: u64 = 42;
