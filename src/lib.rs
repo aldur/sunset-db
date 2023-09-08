@@ -35,15 +35,21 @@ pub enum SunsetDBError {
     #[error("exceeds max size (expected < {})", u64::MAX)]
     ExceedsMaxSize,
 
+    #[error("invalid segment format")]
+    InvalidSegmentFormat(String),
+
     #[error("invalid checksum (expected {expected:?}, found {found:?})")]
     InvalidChecksum { expected: u32, found: u32 },
 
-    #[error("io error")]
-    IO(#[from] io::Error),
-
     // TODO: Return ID?
     #[error("invalid ID")]
-    InvalidID(#[from] std::num::ParseIntError),
+    InvalidID { source: std::num::ParseIntError },
+
+    #[error("can't parse ID from path")]
+    InvalidIDPath(PathBuf),
+
+    #[error("invalid index format: {0:?}")]
+    InvalidIndexFormat(String),
 
     #[error("invalid string")]
     InvalidString {
@@ -54,8 +60,8 @@ pub enum SunsetDBError {
     #[error("invalid int")]
     InvalidInt(#[from] std::num::TryFromIntError),
 
-    #[error("unexpected: {0:?}")]
-    Unexpected(String),
+    #[error("io error")]
+    IOError(#[from] io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, SunsetDBError>;
@@ -105,8 +111,11 @@ impl Segment {
     pub fn get(&mut self, key: &str) -> Result<String> {
         let mut offset: u64 = *self.index.get(key).ok_or(SunsetDBError::KeyNotFound)?;
         assert_eq!(
-            read_string_at_offset(&mut self.file, offset)?
-                .ok_or(SunsetDBError::Unexpected("key should be there".to_string()))?,
+            read_string_at_offset(&mut self.file, offset)?.ok_or(
+                SunsetDBError::InvalidSegmentFormat(
+                    "should find key at offset from index".to_string()
+                )
+            )?,
             key
         );
 
@@ -117,14 +126,12 @@ impl Segment {
     }
 
     fn id_from_path(path: &Path) -> Result<u64> {
-        Ok(path
-            .file_stem()
-            .ok_or(SunsetDBError::Unexpected("Can't get file stem".to_string()))?
+        path.file_stem()
+            .ok_or_else(|| SunsetDBError::InvalidIDPath(path.to_path_buf()))?
             .to_str()
-            .ok_or(SunsetDBError::Unexpected(
-                "Can't convert file stem to &str".to_string(),
-            ))?
-            .parse()?)
+            .ok_or_else(|| SunsetDBError::InvalidIDPath(path.to_path_buf()))?
+            .parse()
+            .map_err(|source| SunsetDBError::InvalidID { source })
     }
 
     fn index_from_disk(file: &mut File) -> Result<Index> {
@@ -140,8 +147,9 @@ impl Segment {
                 break;
             }
 
-            let k = read_string_crc32(file)?
-                .ok_or(SunsetDBError::Unexpected("Expected key".to_string()))?;
+            let k = read_string_crc32(file)?.ok_or(SunsetDBError::InvalidIndexFormat(
+                "tombstone in index".to_string(),
+            ))?;
 
             // TODO: Ignore data invalid checksums.
 
