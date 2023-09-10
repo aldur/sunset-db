@@ -2,7 +2,8 @@
   description = "SunsetDB";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/23.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     crane = {
       url = "github:ipetkov/crane";
@@ -14,6 +15,8 @@
     };
 
     rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.flake-utils.follows = "flake-utils";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -23,11 +26,16 @@
     };
   };
 
-  outputs = { self, nixpkgs, crane, rust-overlay, flake-utils, advisory-db, ... }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, crane, rust-overlay, flake-utils, advisory-db, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
+
         pkgs = import nixpkgs {
+          inherit system overlays;
+        };
+
+        pkgs-unstable = import nixpkgs-unstable {
           inherit system overlays;
         };
 
@@ -37,7 +45,8 @@
         rustToolchain = pkgs.pkgsBuildHost.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
+        unfilteredSrc = craneLib.path ./.;
+        src = craneLib.cleanCargoSource unfilteredSrc;
 
         # Common arguments can be set here to avoid repeating them later
         commonArgs = {
@@ -92,6 +101,32 @@
           # Audit dependencies
           sunsetdb-audit = craneLib.cargoAudit {
             inherit src advisory-db;
+          };
+
+          # TODO: Point to `advisory-db`
+          sunsetdb-deny = craneLib.mkCargoDerivation {
+            buildPhaseCargoCommand = ''
+              cargo deny \
+              --frozen --locked --offline \
+              --all-features --color never \
+              check licenses --disable-fetch
+            '';
+
+            cargoArtifacts = null; # Don't need artifacts, just Cargo.lock
+            doInstallCargoArtifacts = false; # We don't expect to/need to install artifacts
+
+            nativeBuildInputs = [ pkgs-unstable.cargo-deny ];
+
+            src = lib.cleanSourceWith {
+              src = unfilteredSrc;
+              filter = path: type: type == "directory"
+                || lib.hasSuffix ".toml" path  # includes `deny*.toml` and `Cargo.toml`
+                || lib.hasSuffix "Cargo.lock" path
+                || lib.hasSuffix "LICENSE" path
+                || (craneLib.filterCargoSources path type);
+            };
+
+            pnameSuffix = "-deny";
           };
 
           # Run tests with cargo-nextest
