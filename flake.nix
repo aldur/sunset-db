@@ -115,6 +115,9 @@
             cargoArtifacts = null; # Don't need artifacts, just Cargo.lock
             doInstallCargoArtifacts = false; # We don't expect to/need to install artifacts
 
+            # Need cargo-deny >= 0.14 because of this:
+            # https://github.com/EmbarkStudios/cargo-deny/pull/520
+            # Otherwise, won't work w/ Nix derivation and will ALWAYS pull deps.
             nativeBuildInputs = [ pkgs-unstable.cargo-deny ];
 
             src = lib.cleanSourceWith {
