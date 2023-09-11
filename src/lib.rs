@@ -115,8 +115,11 @@ impl Segment {
     }
 
     fn insert(&mut self, key: &str, value: &str) -> Result<()> {
-        // FIXME: This check doesn't make any sense.
-        if value.len() as u64 & TOMBSTONE > 0 || key.len() as u64 > u64::MAX {
+        // `append_string` encoded the `len`, then the string.
+        // `append_deletion` stores `TOMBSTONE` after the key.
+        // Having a `value` with a `len` equal to the TOMBSTONE would
+        // allow confusing it with a deleted entry.
+        if value.len() as u64 == TOMBSTONE || key.len() as u128 > (u64::MAX as u128) {
             return Err(SunsetDBError::ExceedsMaxSize);
         }
 
@@ -152,7 +155,7 @@ impl Segment {
             key
         );
 
-        offset += LEN_PREFIX_SIZE as u64 + key.len() as u64 + CRC32_SUFFIX_SIZE as u64;
+        offset += ENCODED_LEN_SIZE as u64 + key.len() as u64 + CRC32_SIZE as u64;
         let value = read_string_at_offset(&mut self.file, offset)?;
 
         value.ok_or(SunsetDBError::KeyNotFound)
@@ -171,7 +174,7 @@ impl Segment {
                 break;
             }
 
-            let k = read_string_crc32(file)?.ok_or(SunsetDBError::InvalidIndexFormat(
+            let k = read_check_string(file)?.ok_or(SunsetDBError::InvalidIndexFormat(
                 "tombstone in index".to_string(),
             ))?;
 
@@ -181,9 +184,7 @@ impl Segment {
             if len_v_b != ENCODED_TOMBSTONE {
                 index.insert(k, offset);
                 let len_v = parse_u64_bytes(len_v_b)?;
-                file.seek(SeekFrom::Current(i64::try_from(
-                    len_v + CRC32_SUFFIX_SIZE as u64,
-                )?))?;
+                file.seek(SeekFrom::Current(i64::try_from(len_v + CRC32_SIZE as u64)?))?;
             } else {
                 index.remove(&k);
             }
@@ -274,9 +275,10 @@ impl SunsetDB {
     }
 }
 
-const LEN_PREFIX_SIZE: usize = size_of::<u64>();
-const CRC32_SUFFIX_SIZE: usize = size_of::<u32>();
+const ENCODED_LEN_SIZE: usize = size_of::<u64>();
+const CRC32_SIZE: usize = size_of::<u32>();
 
+// -- <TOMBSTONE> --
 fn append_deletion(file: &mut File) -> Result<()> {
     file.seek(io::SeekFrom::End(0))?;
     file.write_all(&ENCODED_TOMBSTONE)?;
@@ -288,6 +290,7 @@ fn append_deletion(file: &mut File) -> Result<()> {
     Ok(())
 }
 
+// -- <len> || <string> || <checksum> --
 fn append_string(file: &mut File, b: &str) -> Result<()> {
     file.seek(io::SeekFrom::End(0))?;
 
@@ -304,17 +307,18 @@ fn append_string(file: &mut File, b: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_u64_bytes(file: &mut File) -> Result<[u8; LEN_PREFIX_SIZE]> {
-    let mut int_b = [0; LEN_PREFIX_SIZE];
+fn read_u64_bytes(file: &mut File) -> Result<[u8; ENCODED_LEN_SIZE]> {
+    let mut int_b = [0; ENCODED_LEN_SIZE];
     file.read_exact(&mut int_b)?;
     Ok(int_b)
 }
 
-fn parse_u64_bytes(i: [u8; LEN_PREFIX_SIZE]) -> Result<u64> {
+fn parse_u64_bytes(i: [u8; ENCODED_LEN_SIZE]) -> Result<u64> {
     Ok(u64::from_be_bytes(i))
 }
 
-fn read_string_crc32(file: &mut File) -> Result<Option<String>> {
+fn read_check_string(file: &mut File) -> Result<Option<String>> {
+    // TODO: Would it be faster to read a bigger chunk into a static array?
     let string_len_b = read_u64_bytes(file)?;
     if string_len_b == ENCODED_TOMBSTONE {
         return Ok(None); // Deleted
@@ -324,7 +328,7 @@ fn read_string_crc32(file: &mut File) -> Result<Option<String>> {
     let mut string_b = vec![0; usize::try_from(string_len)?];
     file.read_exact(&mut string_b)?;
 
-    let mut checksum_b = [0; CRC32_SUFFIX_SIZE];
+    let mut checksum_b = [0; CRC32_SIZE];
     file.read_exact(&mut checksum_b)?;
     let checksum = u32::from_be_bytes(checksum_b);
     let expected = crc32fast::hash(&string_b);
@@ -342,7 +346,7 @@ fn read_string_crc32(file: &mut File) -> Result<Option<String>> {
 fn read_string_at_offset(file: &mut File, offset: u64) -> Result<Option<String>> {
     // TODO: Maybe use `seek_read`?
     file.seek(io::SeekFrom::Start(offset))?;
-    read_string_crc32(file)
+    read_check_string(file)
 }
 
 #[cfg(test)]
@@ -353,12 +357,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     fn encoded_len(k: &str, v: &str) -> u64 {
-        (LEN_PREFIX_SIZE
-            + k.len()
-            + CRC32_SUFFIX_SIZE
-            + LEN_PREFIX_SIZE
-            + v.len()
-            + CRC32_SUFFIX_SIZE) as u64
+        (ENCODED_LEN_SIZE + k.len() + CRC32_SIZE + ENCODED_LEN_SIZE + v.len() + CRC32_SIZE) as u64
     }
 
     fn new_base() -> io::Result<TempDir> {
