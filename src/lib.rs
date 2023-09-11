@@ -6,20 +6,13 @@ use std::mem::size_of;
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
 
-pub type Index = HashMap<String, u64>;
+type Index = HashMap<String, u64>;
 
 const SEGMENT_EXT: &str = "segment";
 
 // TODO: Switch to using an empty byte string as the tombstone?
 const TOMBSTONE: u64 = 1u64 << 63;
 const ENCODED_TOMBSTONE: [u8; size_of::<u64>()] = (TOMBSTONE).to_be_bytes();
-
-// NOTE: This will hold the file open as long as `Segment` is in memory.
-struct Segment {
-    id: u64,
-    file: File,
-    index: Index,
-}
 
 use thiserror::Error;
 
@@ -41,10 +34,6 @@ pub enum SunsetDBError {
     #[error("invalid checksum (expected {expected:?}, found {found:?})")]
     InvalidChecksum { expected: u32, found: u32 },
 
-    // TODO: Return ID?
-    #[error("invalid ID")]
-    InvalidID { source: std::num::ParseIntError },
-
     #[error("can't parse ID from path")]
     InvalidIDPath(PathBuf),
 
@@ -64,10 +53,53 @@ pub enum SunsetDBError {
     IOError(#[from] io::Error),
 }
 
+#[derive(Error, Debug, PartialEq)]
+enum SegmentIDError {
+    #[error("ID is not an int")]
+    NotAnInt,
+
+    #[error("trying to parse ID from an empty path")]
+    IDFromEmtpyPath,
+
+    #[error("trying to parse ID from an invalid (non-utf8) path")]
+    IDFromInvalidPath,
+}
+
 pub type Result<T> = std::result::Result<T, SunsetDBError>;
 
+#[derive(Debug)]
+struct SegmentID(u64);
+
+impl std::str::FromStr for SegmentID {
+    type Err = SegmentIDError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(SegmentID(
+            u64::from_str(s).map_err(|_| SegmentIDError::NotAnInt)?,
+        ))
+    }
+}
+
+impl TryFrom<&Path> for SegmentID {
+    type Error = SegmentIDError;
+
+    fn try_from(path: &Path) -> std::result::Result<Self, Self::Error> {
+        path.file_stem()
+            .ok_or(SegmentIDError::IDFromEmtpyPath)?
+            .to_str()
+            .ok_or(SegmentIDError::IDFromInvalidPath)?
+            .parse()
+    }
+}
+
+// NOTE: This will hold the file open as long as `Segment` is in memory.
+struct Segment {
+    id: SegmentID,
+    file: File,
+    index: Index,
+}
+
 impl Segment {
-    pub fn new(path: &Path) -> Result<Segment> {
+    fn new(path: &Path) -> Result<Segment> {
         let mut f = OpenOptions::new()
             .create(true) // TODO: Should not try to create all segments.
             .read(true)
@@ -75,13 +107,14 @@ impl Segment {
             .open(path)?;
         let index = Segment::index_from_disk(&mut f);
         Ok::<_, _>(Segment {
-            id: Segment::id_from_path(path)?,
+            id: SegmentID::try_from(path)
+                .map_err(|_| SunsetDBError::InvalidIDPath(path.to_path_buf()))?,
             file: f,
             index: index?,
         })
     }
 
-    pub fn insert(&mut self, key: &str, value: &str) -> Result<()> {
+    fn insert(&mut self, key: &str, value: &str) -> Result<()> {
         // FIXME: This check doesn't make any sense.
         if value.len() as u64 & TOMBSTONE > 0 || key.len() as u64 > u64::MAX {
             return Err(SunsetDBError::ExceedsMaxSize);
@@ -101,14 +134,14 @@ impl Segment {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<()> {
+    fn delete(&mut self, key: &str) -> Result<()> {
         append_string(&mut self.file, key)?;
         append_deletion(&mut self.file)?;
         self.index.remove(key).ok_or(SunsetDBError::KeyNotFound)?;
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<String> {
+    fn get(&mut self, key: &str) -> Result<String> {
         let mut offset: u64 = *self.index.get(key).ok_or(SunsetDBError::KeyNotFound)?;
         assert_eq!(
             read_string_at_offset(&mut self.file, offset)?.ok_or(
@@ -123,15 +156,6 @@ impl Segment {
         let value = read_string_at_offset(&mut self.file, offset)?;
 
         value.ok_or(SunsetDBError::KeyNotFound)
-    }
-
-    fn id_from_path(path: &Path) -> Result<u64> {
-        path.file_stem()
-            .ok_or_else(|| SunsetDBError::InvalidIDPath(path.to_path_buf()))?
-            .to_str()
-            .ok_or_else(|| SunsetDBError::InvalidIDPath(path.to_path_buf()))?
-            .parse()
-            .map_err(|source| SunsetDBError::InvalidID { source })
     }
 
     fn index_from_disk(file: &mut File) -> Result<Index> {
@@ -194,7 +218,7 @@ impl SunsetDB {
 
         let next_index: u64;
         if let Some(s) = segments.last() {
-            next_index = s.id + 1;
+            next_index = s.id.0 + 1;
         } else {
             next_index = 0;
         }
@@ -323,6 +347,8 @@ fn read_string_at_offset(file: &mut File, offset: u64) -> Result<Option<String>>
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use tempfile::{tempdir, TempDir};
 
@@ -340,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_base_is_automatically_deleted() -> Result<()> {
+    fn base_is_automatically_deleted_test() -> Result<()> {
         let created_p: PathBuf;
 
         {
@@ -355,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_empty_base_path() -> Result<()> {
+    fn sunsetdb_empty_base_path_test() -> Result<()> {
         let base_dir = new_base()?;
         let s = SunsetDB::new(base_dir.path())?;
         assert_eq!(s.base_path, base_dir.path());
@@ -364,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_insert_get_delete() -> Result<()> {
+    fn sunsetdb_insert_get_delete_test() -> Result<()> {
         let base_dir = new_base()?;
         let mut s = SunsetDB::new(base_dir.path())?;
 
@@ -379,13 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_e2e() -> Result<()> {
+    fn segment_e2e_test() -> Result<()> {
         let new_base = new_base()?;
 
         let id: u64 = 42;
         let segment_path = new_base.path().join(format!("{}.{}", id, SEGMENT_EXT));
         let mut segment = Segment::new(segment_path.as_path())?;
-        assert_eq!(id, segment.id);
+        assert_eq!(id, segment.id.0);
 
         let inputs = [
             ("foo", "bar"),
@@ -416,6 +442,21 @@ mod tests {
 
         let segment_from_disk = Segment::new(segment_path.as_path())?;
         assert_eq!(segment_from_disk.index, segment.index);
+
+        Ok(())
+    }
+
+    #[test]
+    fn segment_id_test() -> std::result::Result<(), Box<dyn Error>> {
+        let id: u64 = 42;
+        let binding = new_base()?.path().join(format!("{}.{}", id, SEGMENT_EXT));
+        let segment_path = binding.as_path();
+        let _segment_id = SegmentID::try_from(segment_path)?;
+        assert!(_segment_id.0 == id);
+
+        let empty_path = PathBuf::new();
+        assert!(SegmentID::try_from(empty_path.as_path())
+            .is_err_and(|e| e == SegmentIDError::IDFromEmtpyPath));
 
         Ok(())
     }
