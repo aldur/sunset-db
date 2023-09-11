@@ -29,13 +29,13 @@
   outputs = { self, nixpkgs, nixpkgs-unstable, crane, rust-overlay, flake-utils, advisory-db, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
-
-        pkgs = import nixpkgs {
-          inherit system overlays;
+        overlay-unstable = final: prev: {
+          unstable = nixpkgs-unstable.legacyPackages.${prev.system};
         };
 
-        pkgs-unstable = import nixpkgs-unstable {
+        overlays = [ (import rust-overlay) overlay-unstable ];
+
+        pkgs = import nixpkgs {
           inherit system overlays;
         };
 
@@ -118,7 +118,7 @@
             # Need cargo-deny >= 0.14 because of this:
             # https://github.com/EmbarkStudios/cargo-deny/pull/520
             # Otherwise, won't work w/ Nix derivation and will ALWAYS pull deps.
-            nativeBuildInputs = [ pkgs-unstable.cargo-deny ];
+            nativeBuildInputs = [ pkgs.unstable.cargo-deny ];
 
             src = lib.cleanSourceWith {
               src = unfilteredSrc;
