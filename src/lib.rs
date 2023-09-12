@@ -1,14 +1,17 @@
+mod error;
+
 use std::collections::HashMap;
-use std::error;
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs::{read_dir, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::result::Result;
 
-pub type Index = HashMap<String, u64>;
+use self::error::*;
+
+type Index = HashMap<String, u64>;
 
 const SEGMENT_EXT: &str = "segment";
 
@@ -16,66 +19,76 @@ const SEGMENT_EXT: &str = "segment";
 const TOMBSTONE: u64 = 1u64 << 63;
 const ENCODED_TOMBSTONE: [u8; size_of::<u64>()] = (TOMBSTONE).to_be_bytes();
 
+#[derive(Debug)]
+struct SegmentID(u64);
+
+impl std::str::FromStr for SegmentID {
+    type Err = SegmentIDError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(SegmentID(
+            u64::from_str(s).map_err(|_| SegmentIDError::NotAnInt)?,
+        ))
+    }
+}
+
+impl TryFrom<&Path> for SegmentID {
+    type Error = SegmentIDError;
+
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        path.file_stem()
+            .ok_or(SegmentIDError::IDFromEmtpyPath)?
+            .to_str()
+            .ok_or(SegmentIDError::IDFromInvalidPath(path.to_path_buf()))?
+            .parse()
+    }
+}
+
 // NOTE: This will hold the file open as long as `Segment` is in memory.
 struct Segment {
-    id: u64,
+    id: SegmentID,
     file: File,
     index: Index,
 }
 
-#[derive(Debug, Clone)]
-pub struct KeyNotFoundError;
-impl fmt::Display for KeyNotFoundError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "key not found")
-    }
-}
-impl error::Error for KeyNotFoundError {}
-
-#[derive(Debug, Clone)]
-pub struct ExceedsMaxSizeError;
-impl fmt::Display for ExceedsMaxSizeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "exceeds max size")
-    }
-}
-impl error::Error for ExceedsMaxSizeError {}
-
-#[derive(Debug, Clone)]
-pub struct InvalidChecksumError;
-impl fmt::Display for InvalidChecksumError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "invalid checksum")
-    }
-}
-impl error::Error for InvalidChecksumError {}
-
-// TODO: Is there a better way to handle errors other than boxing them?
-
 impl Segment {
-    pub fn new(path: &Path) -> Result<Segment, Box<dyn error::Error>> {
+    fn new(path: &Path) -> Result<Segment, SegmentError> {
         let mut f = OpenOptions::new()
             .create(true) // TODO: Should not try to create all segments.
             .read(true)
             .write(true) // TODO: Only most recent segment should be open for write.
-            .open(path)?;
+            .open(path)
+            .map_err(|e| SegmentError::IOErrorAtPath {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
         let index = Segment::index_from_disk(&mut f);
-        Ok::<_, Box<dyn error::Error>>(Segment {
-            id: Segment::id_from_path(path)?,
+        Ok::<_, _>(Segment {
+            id: SegmentID::try_from(path)
+                .map_err(|_| SegmentError::InvalidPath(path.to_path_buf()))?,
             file: f,
             index: index?,
         })
     }
 
-    pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
-        if value.len() as u64 & TOMBSTONE > 0 || key.len() as u64 > u64::MAX {
-            return Err(Box::new(ExceedsMaxSizeError));
+    fn insert(&mut self, key: &str, value: &str) -> Result<(), InsertError> {
+        // `append_string` encodes the `len`, then the string.
+        // `append_deletion` stores `TOMBSTONE` after the key.
+        // Having a `value` with a `len` equal to the TOMBSTONE would
+        // allow confusing it with a deleted entry.
+        // Could be a strict `==`, we make it >= so that there's a clear max size.
+        if value.len() as u64 >= TOMBSTONE {
+            return Err(InsertError::ValueExceedsMaxSize);
+        }
+
+        if key.len() as u128 > (u64::MAX as u128) {
+            return Err(InsertError::KeyExceedsMaxSize);
         }
 
         let offset = self.file.metadata()?.len();
 
-        // TODO: Write the CRC only once per record.
-        // Writing the `key` allows us to reconstruct `index` later on
+        // NOTE: We could write the CRC only once per record.
+        // NOTE: Writing the `key` isn't strictly required,
+        // but it allows us to reconstruct `index` later on.
         append_string(&mut self.file, key)?;
         append_string(&mut self.file, value)?;
 
@@ -86,61 +99,55 @@ impl Segment {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
+    fn delete(&mut self, key: &str) -> Result<(), DeleteError> {
         append_string(&mut self.file, key)?;
         append_deletion(&mut self.file)?;
-        self.index.remove(key).ok_or(KeyNotFoundError)?;
+        self.index.remove(key).ok_or(DeleteError::KeyNotFound)?;
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<String, Box<dyn error::Error>> {
-        let mut offset: u64 = *self.index.get(key).ok_or(KeyNotFoundError)?;
-        assert_eq!(
-            read_string_at_offset(&mut self.file, offset)?.ok_or("key should be there")?,
-            key
+    fn get(&mut self, key: &str) -> Result<String, GetError> {
+        let mut offset: u64 = *self.index.get(key).ok_or(GetError::KeyNotFound)?;
+        debug_assert!(
+            read_string_at_offset(&mut self.file, offset)
+                .is_ok_and(|v| v.is_some_and(|s| s == key)),
+            "should find key at offset from index"
         );
 
-        offset += LEN_PREFIX_SIZE as u64 + key.len() as u64 + CRC32_SUFFIX_SIZE as u64;
+        offset += ENCODED_LEN_SIZE as u64 + key.len() as u64 + CRC32_SIZE as u64;
         let value = read_string_at_offset(&mut self.file, offset)?;
 
-        value.ok_or(Box::new(KeyNotFoundError))
+        value.ok_or(GetError::KeyNotFound)
     }
 
-    fn id_from_path(path: &Path) -> Result<u64, Box<dyn error::Error>> {
-        Ok(path
-            .file_stem()
-            .ok_or("Can't get file stem")?
-            .to_str()
-            .ok_or("Can't convert file stem to &str")?
-            .parse()?)
-    }
-
-    fn index_from_disk(file: &mut File) -> Result<Index, Box<dyn error::Error>> {
+    fn index_from_disk(file: &mut File) -> Result<Index, SegmentError> {
         let mut index = Index::new();
         file.rewind()?; // Should not be required.
 
-        // TODO: If possible, instead of a full disk read read from a dump of the HashMap
+        // TODO: If possible, instead of a full disk read from a dump of the HashMap
 
-        let db_len = file.metadata()?.len();
+        let segment_len = file.metadata()?.len();
         loop {
             let offset = file.stream_position()?;
-            if offset == db_len {
+            if offset == segment_len {
                 break;
             }
 
-            let k = read_string_crc32(file)?.ok_or("Expected key")?;
+            let key = read_check_string(file)?.ok_or(SegmentError::InvalidIndexFormat(
+                "tombstone in index".to_string(),
+            ))?;
 
-            // TODO: Ignore data invalid checksums.
+            // TODO: Ignore keys for values having an invalid checksum.
 
-            let len_v_b = read_u64_bytes(file)?;
-            if len_v_b != ENCODED_TOMBSTONE {
-                index.insert(k, offset);
-                let len_v = parse_u64_bytes(len_v_b)?;
-                file.seek(SeekFrom::Current(i64::try_from(
-                    len_v + CRC32_SUFFIX_SIZE as u64,
-                )?))?;
+            let encoded_value_len = read_u64_bytes(file)?;
+            if encoded_value_len != ENCODED_TOMBSTONE {
+                index.insert(key, offset);
+                let value_len = parse_u64_bytes(encoded_value_len)?;
+                let end_of_encoded_entry = i64::try_from(value_len + CRC32_SIZE as u64)
+                    .map_err(|_| SegmentError::SeekError)?;
+                file.seek(SeekFrom::Current(end_of_encoded_entry))?;
             } else {
-                index.remove(&k);
+                index.remove(&key);
             }
         }
 
@@ -155,10 +162,10 @@ pub struct SunsetDB {
 }
 
 impl SunsetDB {
-    pub fn new(base_path: &Path) -> Result<SunsetDB, Box<dyn error::Error>> {
+    pub fn new(base_path: &Path) -> Result<SunsetDB, SunsetDBError> {
         let mut paths: Vec<_> = read_dir(base_path)?
             // WARNING: This will filter out errors on `read_dir`.
-            .filter_map(Result::ok)
+            .filter_map(std::io::Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension() == Some(OsStr::from_bytes(SEGMENT_EXT.as_bytes())))
             .collect();
@@ -173,40 +180,39 @@ impl SunsetDB {
 
         let next_index: u64;
         if let Some(s) = segments.last() {
-            next_index = s.id + 1;
+            next_index = s.id.0 + 1;
         } else {
             next_index = 0;
         }
 
-        let mut db = SunsetDB {
+        let mut sunset = SunsetDB {
             base_path: base_path.to_path_buf(),
             segments,
             next_index,
         };
 
-        if db.segments.is_empty() {
-            db.add_new_segment()?;
+        if sunset.segments.is_empty() {
+            sunset.add_new_segment()?;
         }
 
-        Ok(db)
+        Ok(sunset)
     }
 
     fn path_from_id(&self, id: u64) -> PathBuf {
         self.base_path.join(format!("{}.{}", id, SEGMENT_EXT))
     }
 
-    fn add_new_segment(&mut self) -> Result<(), Box<dyn error::Error>> {
+    fn add_new_segment(&mut self) -> Result<(), SunsetDBError> {
+        // TODO: We take the index, make it a path, then the segment needs to
+        // re-parse it to know its own index. Strange.
         let path = self.path_from_id(self.next_index);
         self.segments.push(Segment::new(path.as_path())?);
         self.next_index += 1;
         Ok(())
     }
 
-    pub fn insert(&mut self, key: &str, value: &str) -> Result<(), Box<dyn error::Error>> {
-        let segment = self
-            .segments
-            .get_mut(0)
-            .ok_or("there should be at least one segment")?; // Created in `::new`
+    pub fn insert(&mut self, key: &str, value: &str) -> Result<(), InsertError> {
+        let segment = self.segments.get_mut(0).ok_or(InsertError::NoSegments)?; // Created in `::new`
         segment.insert(key, value)?;
 
         // TODO: Close segment if it grows too large.
@@ -215,30 +221,28 @@ impl SunsetDB {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<String, KeyNotFoundError> {
+    pub fn get(&mut self, key: &str) -> Result<String, GetError> {
         for s in self.segments.iter_mut().rev() {
             if let Ok(value) = s.get(key) {
                 return Ok(value);
             }
         }
 
-        Err(KeyNotFoundError)
+        Err(GetError::KeyNotFound)
     }
 
-    pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn error::Error>> {
-        let segment = self
-            .segments
-            .get_mut(0)
-            .ok_or("there should be at least one segment")?; // Created in `::new`
+    pub fn delete(&mut self, key: &str) -> Result<(), DeleteError> {
+        let segment = self.segments.get_mut(0).ok_or(DeleteError::NoSegments)?; // Created in `::new`
         segment.delete(key)?;
         Ok(())
     }
 }
 
-const LEN_PREFIX_SIZE: usize = size_of::<u64>();
-const CRC32_SUFFIX_SIZE: usize = size_of::<u32>();
+const ENCODED_LEN_SIZE: usize = size_of::<u64>();
+const CRC32_SIZE: usize = size_of::<u32>();
 
-fn append_deletion(file: &mut File) -> Result<(), Box<dyn error::Error>> {
+// -- <TOMBSTONE> --
+fn append_deletion(file: &mut File) -> Result<(), io::Error> {
     file.seek(io::SeekFrom::End(0))?;
     file.write_all(&ENCODED_TOMBSTONE)?;
 
@@ -249,74 +253,77 @@ fn append_deletion(file: &mut File) -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-fn append_string(file: &mut File, b: &str) -> Result<(), Box<dyn error::Error>> {
+// -- <len> || <string> || <checksum> --
+fn append_string(file: &mut File, b: &str) -> Result<(), io::Error> {
     file.seek(io::SeekFrom::End(0))?;
 
     // Cast all to u64 and use big endian to make this portable across machines.
-    let b_len_bytes = b.len().to_be_bytes();
-    file.write_all(&b_len_bytes)?;
+    let encoded_len = b.len().to_be_bytes();
+    file.write_all(&encoded_len)?;
 
-    let b_bytes = b.as_bytes();
-    file.write_all(b_bytes)?;
+    let encoded_b = b.as_bytes();
+    file.write_all(encoded_b)?;
 
-    let checksum = crc32fast::hash(b_bytes);
+    let checksum = crc32fast::hash(encoded_b);
     file.write_all(&checksum.to_be_bytes())?;
 
     Ok(())
 }
 
-fn read_u64_bytes(file: &mut File) -> Result<[u8; LEN_PREFIX_SIZE], Box<dyn error::Error>> {
-    let mut int_b = [0; LEN_PREFIX_SIZE];
-    file.read_exact(&mut int_b)?;
-    Ok(int_b)
+fn read_u64_bytes(file: &mut File) -> Result<[u8; ENCODED_LEN_SIZE], ReadError> {
+    let mut read_buffer = [0; ENCODED_LEN_SIZE];
+    file.read_exact(&mut read_buffer)?;
+    Ok(read_buffer)
 }
 
-fn parse_u64_bytes(i: [u8; LEN_PREFIX_SIZE]) -> Result<u64, Box<dyn error::Error>> {
-    Ok(u64::from_be_bytes(i))
+fn parse_u64_bytes(bytes: [u8; ENCODED_LEN_SIZE]) -> Result<u64, ReadError> {
+    Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_string_crc32(file: &mut File) -> Result<Option<String>, Box<dyn error::Error>> {
-    let string_len_b = read_u64_bytes(file)?;
-    if string_len_b == ENCODED_TOMBSTONE {
+fn read_check_string(file: &mut File) -> Result<Option<String>, ReadError> {
+    // TODO: Would it be faster to read a bigger chunk into a static array?
+    let encoded_string_len = read_u64_bytes(file)?;
+    if encoded_string_len == ENCODED_TOMBSTONE {
         return Ok(None); // Deleted
     }
 
-    let string_len = parse_u64_bytes(string_len_b)?;
-    let mut string_b = vec![0; usize::try_from(string_len)?];
-    file.read_exact(&mut string_b)?;
+    let string_len = parse_u64_bytes(encoded_string_len)?;
+    let mut encoded_string = vec![0; usize::try_from(string_len)?];
+    file.read_exact(&mut encoded_string)?;
 
-    let mut checksum_b = [0; CRC32_SUFFIX_SIZE];
-    file.read_exact(&mut checksum_b)?;
-    let checksum = u32::from_be_bytes(checksum_b);
+    let mut encoded_checksum = [0; CRC32_SIZE];
+    file.read_exact(&mut encoded_checksum)?;
+    let checksum = u32::from_be_bytes(encoded_checksum);
+    let expected = crc32fast::hash(&encoded_string);
 
-    if checksum != crc32fast::hash(&string_b) {
-        return Err(Box::new(InvalidChecksumError));
+    if checksum != expected {
+        return Err(ReadError::InvalidChecksum {
+            expected,
+            found: checksum,
+        });
     }
 
-    Ok(Some(String::from_utf8(string_b)?))
+    Ok(Some(String::from_utf8(encoded_string)?))
 }
 
-fn read_string_at_offset(
-    file: &mut File,
-    offset: u64,
-) -> Result<Option<String>, Box<dyn error::Error>> {
+fn read_string_at_offset(file: &mut File, offset: u64) -> Result<Option<String>, ReadError> {
     // TODO: Maybe use `seek_read`?
     file.seek(io::SeekFrom::Start(offset))?;
-    read_string_crc32(file)
+    read_check_string(file)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use tempfile::{tempdir, TempDir};
 
+    // Bad practice, but anything's allowed in tests :)
+    type TestResult = Result<(), Box<dyn Error>>;
+
     fn encoded_len(k: &str, v: &str) -> u64 {
-        (LEN_PREFIX_SIZE
-            + k.len()
-            + CRC32_SUFFIX_SIZE
-            + LEN_PREFIX_SIZE
-            + v.len()
-            + CRC32_SUFFIX_SIZE) as u64
+        (ENCODED_LEN_SIZE + k.len() + CRC32_SIZE + ENCODED_LEN_SIZE + v.len() + CRC32_SIZE) as u64
     }
 
     fn new_base() -> io::Result<TempDir> {
@@ -324,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_base_is_automatically_deleted() -> Result<(), Box<dyn error::Error>> {
+    fn base_is_automatically_deleted_test() -> TestResult {
         let created_p: PathBuf;
 
         {
@@ -339,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_empty_base_path() -> Result<(), Box<dyn error::Error>> {
+    fn sunsetdb_empty_base_path_test() -> TestResult {
         let base_dir = new_base()?;
         let s = SunsetDB::new(base_dir.path())?;
         assert_eq!(s.base_path, base_dir.path());
@@ -348,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sunsetdb_insert_get_delete() -> Result<(), Box<dyn error::Error>> {
+    fn sunsetdb_insert_get_delete_test() -> TestResult {
         let base_dir = new_base()?;
         let mut s = SunsetDB::new(base_dir.path())?;
 
@@ -363,13 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_e2e() -> Result<(), Box<dyn error::Error>> {
+    fn segment_e2e_test() -> TestResult {
         let new_base = new_base()?;
 
         let id: u64 = 42;
         let segment_path = new_base.path().join(format!("{}.{}", id, SEGMENT_EXT));
         let mut segment = Segment::new(segment_path.as_path())?;
-        assert_eq!(id, segment.id);
+        assert_eq!(id, segment.id.0);
 
         let inputs = [
             ("foo", "bar"),
@@ -400,6 +407,47 @@ mod tests {
 
         let segment_from_disk = Segment::new(segment_path.as_path())?;
         assert_eq!(segment_from_disk.index, segment.index);
+
+        Ok(())
+    }
+
+    #[test]
+    fn segment_id_test() -> TestResult {
+        let id: u64 = 42;
+        let binding = new_base()?.path().join(format!("{}.{}", id, SEGMENT_EXT));
+        let segment_path = binding.as_path();
+        let _segment_id = SegmentID::try_from(segment_path)?;
+        assert!(_segment_id.0 == id);
+
+        let empty_path = PathBuf::new();
+        assert!(SegmentID::try_from(empty_path.as_path())
+            .is_err_and(|e| e == SegmentIDError::IDFromEmtpyPath));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sunsetdb_io_error_test() -> TestResult {
+        let empty_path = PathBuf::new();
+        let maybe_db = SunsetDB::new(empty_path.as_path());
+
+        assert!(matches!(maybe_db, Err(SunsetDBError::IOError(_))));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sunsetdb_force_segment_error_test() -> TestResult {
+        let base_dir = new_base()?;
+        let mut s = SunsetDB::new(base_dir.path())?;
+
+        base_dir.close()?; // This deletes the temporary directory.
+
+        let maybe_success = s.add_new_segment();
+        assert!(matches!(
+            maybe_success,
+            Err(SunsetDBError::SegmentError(segment_error)) if matches!(&segment_error, SegmentError::IOErrorAtPath { path: _, source: _ })
+        ));
 
         Ok(())
     }
